@@ -5,133 +5,193 @@ app.use(express.json({ limit: "200kb" }));
 
 app.get("/", (req, res) => res.send("OK"));
 
-function pickArray(obj) {
-  // Try common shapes
-  return obj?.searchResults || obj?.results || obj?.data || obj?.items || [];
+function isArr(x){ return Array.isArray(x); }
+function toStr(x){ return (x ?? "").toString(); }
+function low(x){ return toStr(x).toLowerCase(); }
+function num(x){ const n = Number(x); return Number.isFinite(n) ? n : null; }
+
+// Pull titles + ids from lots of possible shapes
+function extractCandidates(sData) {
+  const out = [];
+
+  // Common containers
+  const buckets = [];
+
+  // 1) direct arrays
+  if (isArr(sData?.searchResults)) buckets.push(sData.searchResults);
+  if (isArr(sData?.results)) buckets.push(sData.results);
+  if (isArr(sData?.data)) buckets.push(sData.data);
+  if (isArr(sData?.items)) buckets.push(sData.items);
+
+  // 2) nested: searchResults[].contents / searchResults[].results
+  if (isArr(sData?.searchResults)) {
+    for (const b of sData.searchResults) {
+      if (isArr(b?.contents)) buckets.push(b.contents);
+      if (isArr(b?.results)) buckets.push(b.results);
+      if (isArr(b?.items)) buckets.push(b.items);
+    }
+  }
+
+  // Flatten buckets into candidates
+  for (const arr of buckets) {
+    for (const r of arr) {
+      const name =
+        toStr(r?.name) ||
+        toStr(r?.title) ||
+        toStr(r?.displayName) ||
+        toStr(r?.contentName) ||
+        toStr(r?.content?.name) ||
+        toStr(r?.content?.title);
+
+      const placeId =
+        num(r?.placeId) ??
+        num(r?.rootPlaceId) ??
+        num(r?.contentId) ??
+        num(r?.id) ??
+        num(r?.content?.placeId) ??
+        num(r?.content?.rootPlaceId) ??
+        num(r?.content?.id);
+
+      const universeId =
+        num(r?.universeId) ??
+        num(r?.content?.universeId) ??
+        num(r?.universe?.id);
+
+      if (name || placeId || universeId) {
+        out.push({ name, placeId, universeId, raw: r });
+      }
+      if (out.length >= 200) return out;
+    }
+  }
+
+  return out;
 }
 
-function getName(x) {
-  return (x?.name || x?.title || x?.displayName || x?.contentName || "").toString();
+// UniverseId from PlaceId (newer endpoint we used earlier is fine)
+async function universeFromPlace(placeId) {
+  const url = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`;
+  const r = await fetch(url, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return num(j?.universeId);
 }
 
-function getPlaceId(x) {
-  const v = x?.placeId ?? x?.rootPlaceId ?? x?.id ?? x?.contentId ?? x?.place?.id;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
+app.get("/api/debug", async (req, res) => {
+  try {
+    const qRaw = toStr(req.query.q).trim();
+    if (!qRaw) return res.json({ ok:false, error:"Missing ?q=" });
 
-function getUniverseId(x) {
-  const v = x?.universeId ?? x?.universe?.id ?? x?.universe?.universeId;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
+    // IMPORTANT: correct param casing per devforum examples
+    const searchUrl =
+      "https://apis.roblox.com/search-api/omni-search" +
+      `?searchQuery=${encodeURIComponent(qRaw)}` +
+      `&sessionId=0` +
+      `&pageType=all`;
+
+    const s = await fetch(searchUrl, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
+    const text = await s.text();
+
+    let sData = null;
+    try { sData = JSON.parse(text); } catch {}
+
+    const candidates = sData ? extractCandidates(sData) : [];
+    const preview = candidates.slice(0, 20).map(c => ({
+      name: c.name,
+      placeId: c.placeId,
+      universeId: c.universeId
+    }));
+
+    return res.json({
+      ok: true,
+      status: s.status,
+      searchUrl,
+      topLevelKeys: sData ? Object.keys(sData) : null,
+      previewCount: preview.length,
+      preview
+    });
+  } catch (e) {
+    return res.json({ ok:false, error:String(e?.message || e) });
+  }
+});
 
 app.post("/api/oldest", async (req, res) => {
   try {
-    const qRaw = (req.body?.q ?? "").toString().trim();
-    const q = qRaw.toLowerCase();
-    if (!q) return res.json({ ok: false, error: "Empty query" });
-    if (q.length > 40) return res.json({ ok: false, error: "Query too long" });
+    const qRaw = toStr(req.body?.q).trim();
+    const q = low(qRaw);
 
-    // 1) Omni search (games)
-    // Roblox devforum: use omni-search for search results content
+    if (!qRaw) return res.json({ ok:false, error:"Empty query" });
+    if (qRaw.length > 40) return res.json({ ok:false, error:"Query too long" });
+
+    // Correct param casing
     const searchUrl =
       "https://apis.roblox.com/search-api/omni-search" +
-      `?SearchQuery=${encodeURIComponent(qRaw)}` +
-      `&SessionId=0` +
-      `&pageType=games`;
+      `?searchQuery=${encodeURIComponent(qRaw)}` +
+      `&sessionId=0` +
+      `&pageType=all`;
 
     const s = await fetch(searchUrl, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
-    if (!s.ok) return res.json({ ok: false, error: `Roblox search error: ${s.status}` });
+    if (!s.ok) return res.json({ ok:false, error:`Roblox search error: ${s.status}` });
+
     const sData = await s.json();
+    const all = extractCandidates(sData);
 
-    const arr = pickArray(sData);
-    if (!Array.isArray(arr) || arr.length === 0) {
-      return res.json({ ok: false, error: "No search results" });
+    // Keep only ones whose TITLE includes keyword
+    const matches = all.filter(c => c.name && low(c.name).includes(q));
+
+    if (matches.length === 0) {
+      return res.json({
+        ok: false,
+        error: "No matching titles in results",
+        sampleTitles: all.slice(0, 15).map(x => x.name).filter(Boolean)
+      });
     }
 
-    // Extract candidates
-    const candidates = [];
-    for (const r of arr) {
-      const name = getName(r);
-      if (!name) continue;
-      if (!name.toLowerCase().includes(q)) continue; // must be in title
-
-      const placeId = getPlaceId(r);
-      const universeId = getUniverseId(r);
-
-      // Need at least one to continue
-      if (!placeId && !universeId) continue;
-
-      candidates.push({ name, placeId, universeId });
-      if (candidates.length >= 40) break; // keep it light
-    }
-
-    if (candidates.length === 0) {
-      return res.json({ ok: false, error: "No matching titles in results" });
-    }
-
-    // 2) Fill universeIds (if missing) using placeId -> universe endpoint
-    for (const c of candidates) {
+    // Fill universeIds if missing
+    for (const c of matches) {
       if (!c.universeId && c.placeId) {
-        const uUrl = `https://apis.roblox.com/universes/v1/places/${c.placeId}/universe`;
-        const uRes = await fetch(uUrl, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
-        if (uRes.ok) {
-          const uJson = await uRes.json();
-          const uId = Number(uJson?.universeId);
-          if (Number.isFinite(uId)) c.universeId = uId;
-        }
+        c.universeId = await universeFromPlace(c.placeId);
       }
     }
 
-    const universeIds = [...new Set(candidates.map(c => c.universeId).filter(Boolean))];
+    const universeIds = [...new Set(matches.map(m => m.universeId).filter(Boolean))];
     if (universeIds.length === 0) {
-      return res.json({ ok: false, error: "Could not resolve universeIds" });
+      return res.json({ ok:false, error:"Could not resolve universeIds" });
     }
 
-    // 3) Get game details (includes created + rootPlaceId)
+    // Fetch game info (created, creator, rootPlaceId)
     const infoUrl = `https://games.roblox.com/v1/games?universeIds=${universeIds.join(",")}`;
-    const gRes = await fetch(infoUrl, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
-    if (!gRes.ok) return res.json({ ok: false, error: `Roblox games info error: ${gRes.status}` });
-    const gJson = await gRes.json();
+    const g = await fetch(infoUrl, { headers: { "User-Agent": "oldest-game-finder/1.0" } });
+    if (!g.ok) return res.json({ ok:false, error:`Roblox games info error: ${g.status}` });
 
+    const gJson = await g.json();
     const games = gJson?.data || [];
-    if (!Array.isArray(games) || games.length === 0) {
-      return res.json({ ok: false, error: "No game info returned" });
-    }
+    if (!isArr(games) || games.length === 0) return res.json({ ok:false, error:"No game info returned" });
 
-    // 4) Pick oldest by created date, still enforcing keyword in title
     let oldest = null;
-    for (const g of games) {
-      const name = (g?.name || "").toString();
-      if (!name || !name.toLowerCase().includes(q)) continue;
+    for (const game of games) {
+      const name = toStr(game?.name);
+      if (!name || !low(name).includes(q)) continue;
 
-      const created = g?.created || g?.createdAt || g?.createDate || null;
-      if (!created) continue;
-
+      const created = toStr(game?.created || game?.createdAt || game?.createDate);
       const t = Date.parse(created);
       if (!Number.isFinite(t)) continue;
 
-      const placeId = Number(g?.rootPlaceId) || null;
-      const creator = (g?.creator?.name || "Unknown").toString();
-
+      const placeId = num(game?.rootPlaceId);
       if (!placeId) continue;
+
+      const creator = toStr(game?.creator?.name || "Unknown");
 
       if (!oldest || t < Date.parse(oldest.created)) {
         oldest = { placeId, name, creator, created };
       }
     }
 
-    if (!oldest) {
-      return res.json({ ok: false, error: "Not found (no created dates matched)" });
-    }
-
-    return res.json({ ok: true, ...oldest });
+    if (!oldest) return res.json({ ok:false, error:"Not found (no created dates matched)" });
+    return res.json({ ok:true, ...oldest });
   } catch (e) {
-    return res.json({ ok: false, error: String(e?.message || e) });
+    return res.json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-// Bind to all interfaces for tunneling
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log("Listening on http://127.0.0.1:" + PORT));
+app.listen(PORT, "0.0.0.0", () => console.log("Listening on " + PORT));
